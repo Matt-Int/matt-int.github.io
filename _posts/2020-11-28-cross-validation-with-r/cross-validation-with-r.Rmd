@@ -1,0 +1,241 @@
+---
+title: "Cross-Validation with R"
+description: |
+  A short description of the post.
+author:
+  - name: Mattias
+date: 11-28-2020
+output:
+  distill::distill_article:
+    self_contained: false
+    toc: true
+---
+
+
+``` {r setup, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(rsample)
+library(ranger)
+library(hrbrthemes)
+```
+
+# Introduction
+
+In this document we will explore how to use cross-validation as a tool for model selection and what some of the best-practices are in terms of estimating model fitness.
+
+This document should accompany a presentation based on the same code, although for brevity the presentation has been simplified and may not contain all the commentary available on here.
+
+If you wanted to run the code in this document then you would have to install and load the following packages:
+- tidyverse
+- rsample
+- ranger
+
+# The data
+
+First we should have a quick look at the data we will be creating our model for. We will be using the `diamonds` dataset from the `ggplot2` package.
+
+## A quick look
+
+From `glimpse`ing the data we can see that it is made up of `r length(diamonds)` features across `r nrow(diamonds)` observations. Additionally, each feature is encoded appropriately as `ordered factors` (ordinal) or as `doubles` (numerical). As this data is already preprocessed we will not be doing any data-manipulation to pre-process the data.
+
+If we were doing some kind of cluster analysis as opposed to predictive modelling then we would perhaps consider centering and scaling our features, however, as we are primarily looking to only test linear models and random forests, no scaling should be necessary.
+
+```{r Glimpse data, echo=TRUE}
+
+glimpse(diamonds)
+
+```
+
+# The modelling
+
+## Methodology
+
+For simplicity we will use all `r length(diamonds)` available features to try and predict the price of a diamond. We will also use cross-validation to compare two kinds of models prior to testing our final model's accuracy.
+
+In essence we will go through the following steps:
+
+1. Split the data into a training and testing set
+2. Create a 5-fold cross-validation set out of the testing set
+3. Train a model on the training data using a `linear model` and `random forest`
+4. Compare the `RMSE` of both models to find which performs best
+5. Select the best performing model
+6. Train on the full training data
+7. Find the accuracy with the new model by comparing predicted prices vs. actual prices in the test data
+
+
+## Preparing the data
+
+For reproducibility we will set a seed at the start of each code chunk. This is purely so that if you were to rerun this code you **should** get the exact same results as in this document.
+
+```{r Training Testing sets, echo=TRUE}
+set.seed(1126)
+data_split <- initial_split(diamonds, prop = 0.75)
+training_data <- training(data_split)
+testing_data <- testing(data_split)
+```
+
+This will split the data into two sets, a `training` set and a `testing` set.
+As we specified the `prop` parameter to be equal to `0.75` we can expect around 75% of the data to be in the training set and 25% in the test set.
+
+## What is cross-validation?
+
+A simplified version of cross-validation could be described like so:
+
+- Split the data into `v` splits (or folds)
+- Partition each fold into a training and validation set
+- Train a model and validate its performance
+- The average error is then used to estimate the performance of this type of model
+
+## Creating cross-validations
+
+The package we will use for cross-validation in R is called `rsample`.
+
+```{r cross-folds, echo=TRUE}
+set.seed(1126)
+cv_split <- vfold_cv(training_data, v = 5)
+cv_data <- cv_split %>%
+	mutate(
+	       train = map(splits, ~training(.x)),
+	       validate = map(splits, ~testing(.x))
+	)
+cv_data
+```
+
+The way the code above works is that it calls the `vfold_cv` function and passes the training data to it. We then specify the `v` argument to be 5, this is the number of folds we want to use.
+
+We store the result of this function call as a variable called `cv_data` (crossvalidation_data). We then take `cv_data` and mutate it to create two new variables (columns); train and validate. 
+
+The contents of these two will be the `splits` column, which is part of `cv_data`, and splitting that out to a train and testing combo. In the case of cross-validation however, we call our test set "validation" instead.
+
+## Measuring the accuracy of a model
+
+As we want to pick the best model in terms of predictive power we need a way to estimate how good different models perform in our cross-validation tests. One way to do so is to use the `Root Mean Square Error`, also known as `RMSE`. This is a measure of how much, on average, our model is wrong. It is a common measure for determining the accuracy of regression models. If you were building a classification model instead then you would probably want to use another accuracy measure like `accuracy`, `recall`, or `precision` which are implemented in the `Metrics` package. 
+
+*Note: we will not cover these in this document but may be part of a future training*
+
+The `RMSE` can be calculated as follows:
+
+$$ \sqrt{\frac{\sum_{i = 1}^{n} (\hat{y_{i}} - y_{i})^2}{n}} $$ 
+
+Where $\hat{y}$ is the predicted value and $y$ is the observed value.
+
+## Using map to fit linear models to predict price
+
+We can again use `map` and its sibling `map2` to:
+
+1. Fit a model to each training set, 
+2. Predict what the price should be for each observation in the validation set,
+3. Extract what the actual value was for each observation in the validation set
+4. Calculate the `RMSE` through subtracting all the predicted values from the observed values, squaring the difference, taking the mean of them and squaring the result.
+
+After these steps we end up with a data frame that has the `RMSE` for each fold, we can then `summarise` these together to see what the average `RMSE` was for our linear model.
+
+```{r linear model, echo=TRUE}
+set.seed(1126)
+rmse_lm <- cv_data %>%
+	mutate(
+	       model = map(train, ~lm(price ~ ., data = .x)),
+	       price_predicted = map2(model, validate, ~predict(.x, .y)),
+	       price_actual = map(validate, ~.x$price),
+	       rmse = map2_dbl(price_predicted, price_actual, ~sqrt(mean((.x - .y)^2)))
+	       ) %>%
+	summarise(rmse = mean(rmse)) %>% pull()
+
+rmse_lm
+
+```
+
+That gives us an `RMSE` of `r round(rmse_lm)`, that means that, on average, this model is around `r paste0("$",round(rmse_lm, 2))` off.
+
+## Let's compare it with a random forest
+
+We can run the exact same modelling process but instead of `lm` we can fit a random forest using the `ranger` package. The primary difference in the two (apart from the model function) is that for the `predict` function we have to specify the prediction element from the returned object. This is specified by the "\$prediction" part.
+
+```{r random forest, echo=TRUE}
+set.seed(1126)
+rmse_ranger <- cv_data %>%
+	mutate(
+	       model = map(train, ~ranger(price ~ ., data = .x)),
+	       price_predicted = map2(model, validate, ~predict(.x,.y)$prediction),
+	       price_actual = map(validate, ~.x$price),
+	       rmse = map2_dbl(price_predicted, price_actual, ~sqrt(mean((.x-.y)^2)))
+	) %>%
+	summarise(rmse = mean(rmse)) %>% pull()
+rmse_ranger
+```
+
+This seems to be a better fit to our data as the random forest is on average `r paste0("$",round( rmse_lm - rmse_ranger, 0))` closer to the observed price.
+
+## Selecting a model
+
+As such we will select the Random forest model as it has a smaller error compared to the linear model. However, it might be prudent to see which random forest will perform the best as tweaking some parameters could improve accuracy.
+
+For this example we will tweak the `mtry` parameter as it could have a positive (or negative) impact on our model's predictive power.
+
+```{r mtry testing, echo=TRUE, message=FALSE}
+set.seed(1126)
+cv_data %>%
+	crossing(mtry = 1:6) %>%
+	mutate(
+	       model = map2(train, mtry, ~ranger(price ~ ., data = .x, mtry = .y)),
+	       price_predicted = map2(model, validate, ~predict(.x,.y)$prediction),
+	       price_actual = map(validate, ~.x$price),
+	       rmse = map2_dbl(price_predicted, price_actual, ~sqrt(mean((.x-.y)^2)))
+	) %>%
+	group_by(mtry) %>%
+	summarise(rmse = mean(rmse)) 
+	
+```
+
+The main difference from our previous cross-validation is that we have used the `crossing` function to expand the data with a new variable, essentially copying the original `cv_data` into 6 version with the new `mtry` variable the only difference.
+
+We can then use `map2` to pass the `mtry` variable in and fit random forests with these different ones. 
+
+*Note: If you were doing some cluster analysis, this would be a good way to run multiple versions of `kmeans` to then do a silhouette analysis or similar.*
+
+We can see the default `mtry = 3` performs better than `1` and `2` but we seem to reduce the error more at `mtry = 5`
+
+## Quick recap
+
+We have so far compared a random forest and a linear model and selected the random forest as it's prediction error was lower than for the linear model.
+
+We then compared the accuracy of different random forests with different parameters.
+
+Our final model is a random forest with the parameter `mtry = 5`
+
+## Running and testing the accuracy of our model
+
+Let's fit our random forest, with `mtry = 5` as our parameter on our full `training_data` that we defined at the beginning. We can then generate the predicted prices from our `testing_data` and extract the actual prices from the same set.
+
+```{r final model, echo=TRUE}
+set.seed(1126)
+model <- ranger(price ~ ., data = training_data, mtry = 5)
+price_predicted  <- predict(model, testing_data)$predict
+price_actual <- testing_data$price
+
+(rmse <- sqrt(mean((price_predicted - price_actual)^2)))
+```
+
+Calculating the `RMSE` shows us an average error of approx. `r paste0("$", round(rmse, 0))`.
+
+
+## Visualising the performance of our model
+
+Finally we can quickly visualise the performance of our model by plotting the predicted values against the actual values in a scatter plot. We can also add a line with a slope of 1 and an intercept of 0 to show where the points should be if there was no error in our model.
+
+```{r accuracy visual}
+tibble(actual = price_actual,
+       predicted = price_predicted
+       ) %>% ggplot(aes(x = predicted, y = actual)) + geom_point(alpha = 0.1) +
+	geom_abline(aes(slope = 1, intercept = 0), color = "red") + 
+	labs(
+	     title = "Actual vs. Predicted Performance",
+	     x = "Predicted Price",
+	     y = "Actual Price",
+	     caption = "Random Forest model using ranger with mtry = 5"
+	) + theme_minimal()
+```
+
+
+
+
